@@ -3,6 +3,8 @@
 import json
 from types import SimpleNamespace
 
+import anthropic
+import httpx2
 import pytest
 
 from model_gateway import BudgetExceeded, Gateway, cost
@@ -11,12 +13,15 @@ from model_gateway import BudgetExceeded, Gateway, cost
 class FakeMessages:
     """Stands in for client.beta.messages: every call uses 1,000 input and 100 output tokens."""
 
-    def __init__(self, answers_as=None):
+    def __init__(self, answers_as=None, fails=None):
         self.requests = []
         self.answers_as = answers_as  # the model that answers, when it is not the one that was asked
+        self.fails = fails or {}  # model -> the error it raises
 
     def create(self, **request):
         self.requests.append(request)
+        if request["model"] in self.fails:
+            raise self.fails[request["model"]]
         return response(self.answers_as or request["model"])
 
     parse = create
@@ -28,7 +33,16 @@ def response(model: str, **usage):
 
 
 def fake_client(**options):
-    return SimpleNamespace(beta=SimpleNamespace(messages=FakeMessages(**options)))
+    client = SimpleNamespace(beta=SimpleNamespace(messages=FakeMessages(**options)), options={})
+    client.with_options = lambda **options: client.options.update(options) or client
+    return client
+
+
+REQUEST = httpx2.Request("POST", "https://api.anthropic.com/v1/messages")
+
+
+def status_error(code: int, kind=anthropic.APIStatusError):
+    return kind("failed", response=httpx2.Response(code, request=REQUEST), body=None)
 
 
 def sent(client) -> dict:
@@ -140,3 +154,53 @@ def test_the_budget_of_a_key_holds_across_runs_and_does_not_touch_other_keys(tmp
     with pytest.raises(BudgetExceeded):
         Gateway(fake_client(), key="eval", budget_usd=0.003, ledger=ledger).create(task="generate", messages=[])
     Gateway(fake_client(), key="demo", budget_usd=0.003, ledger=ledger).create(task="generate", messages=[])
+
+
+@pytest.mark.parametrize("error", [
+    status_error(429, anthropic.RateLimitError), status_error(500, anthropic.InternalServerError), status_error(529),
+    anthropic.APITimeoutError(REQUEST), anthropic.APIConnectionError(request=REQUEST)],
+    ids=["rate limit", "server error", "overloaded", "timeout", "no connection"])
+def test_a_model_that_fails_hands_the_call_to_the_next_tier(error):
+    client = fake_client(fails={"claude-haiku-4-5": error})
+    gateway = Gateway(client, routes={"rewrite": ["small", "large"]})
+
+    answer = gateway.create(task="rewrite", messages=[])
+
+    assert answer.model == "claude-sonnet-5-5" and len(client.beta.messages.requests) == 2
+    assert (gateway.calls[0]["tier"], gateway.calls[0]["fallback"]) == ("large", True)
+
+
+def test_the_first_tier_answers_when_it_can():
+    gateway = Gateway(fake_client(), routes={"rewrite": ["small", "large"]})
+    gateway.create(task="rewrite", messages=[])
+    assert (gateway.calls[0]["tier"], gateway.calls[0]["fallback"]) == ("small", False)
+
+
+def test_a_rejected_request_is_raised_without_trying_another_model():
+    client = fake_client(fails={"claude-haiku-4-5": status_error(400, anthropic.BadRequestError)})
+    gateway = Gateway(client, routes={"rewrite": ["small", "large"]})
+
+    with pytest.raises(anthropic.BadRequestError):
+        gateway.create(task="rewrite", messages=[])
+    assert len(client.beta.messages.requests) == 1 and gateway.calls == []
+
+
+def test_when_every_tier_fails_the_last_error_is_raised_and_nothing_is_charged():
+    client = fake_client(fails={"claude-haiku-4-5": status_error(529),
+                                "claude-sonnet-5-5": anthropic.APITimeoutError(REQUEST)})
+    gateway = Gateway(client, routes={"rewrite": ["small", "large"]})
+
+    with pytest.raises(anthropic.APITimeoutError):
+        gateway.create(task="rewrite", messages=[])
+    assert gateway.calls == [] and gateway.spent == 0
+
+
+def test_the_timeout_applies_to_each_attempt():
+    client = fake_client()
+    Gateway(client, timeout=30).create(task="generate", messages=[])
+    assert client.options == {"timeout": 30}
+
+
+def test_a_route_without_tiers_fails_at_construction():
+    with pytest.raises(ValueError):
+        Gateway(fake_client(), routes={"rewrite": []})

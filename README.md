@@ -48,6 +48,10 @@ model against the large one on the same evaluation set.
   4.5) is removed from the request.
 - **Cost per call.** `gateway.calls` holds one record per call: key, task, tier, the model that answered, tokens,
   USD at list price and milliseconds. With `ledger="ledger.jsonl"` each record is also appended to that file.
+- **Budget per key.** `Gateway(client, key="eval", budget_usd=1.00, ledger="ledger.jsonl")` raises
+  `BudgetExceeded` instead of calling the model once the key has spent a dollar. The spend of a key is the sum of
+  its ledger lines, so the limit holds across runs. The check runs before each call: a key can overshoot by one
+  call.
 
 ```
 uv sync

@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from model_gateway import Gateway, cost
+from model_gateway import BudgetExceeded, Gateway, cost
 
 
 class FakeMessages:
@@ -120,3 +120,23 @@ def test_the_ledger_gets_one_line_per_call(tmp_path):
 
     lines = [json.loads(line) for line in ledger.read_text(encoding="utf-8").splitlines()]
     assert lines == gateway.calls and [line["task"] for line in lines] == ["generate", "judge"]
+
+
+def test_a_key_that_has_spent_its_budget_gets_no_more_calls():
+    client = fake_client()
+    gateway = Gateway(client, key="eval", budget_usd=0.005)  # each call costs $0.003
+    gateway.create(task="generate", messages=[])
+    gateway.create(task="generate", messages=[])  # $0.003 spent is still under the budget, so this one runs
+
+    with pytest.raises(BudgetExceeded, match="eval"):
+        gateway.create(task="generate", messages=[])
+    assert len(client.beta.messages.requests) == 2 and gateway.spent == pytest.approx(0.006)
+
+
+def test_the_budget_of_a_key_holds_across_runs_and_does_not_touch_other_keys(tmp_path):
+    ledger = tmp_path / "ledger.jsonl"
+    Gateway(fake_client(), key="eval", ledger=ledger).create(task="generate", messages=[])
+
+    with pytest.raises(BudgetExceeded):
+        Gateway(fake_client(), key="eval", budget_usd=0.003, ledger=ledger).create(task="generate", messages=[])
+    Gateway(fake_client(), key="demo", budget_usd=0.003, ledger=ledger).create(task="generate", messages=[])

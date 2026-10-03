@@ -4,9 +4,9 @@ One entry point for the model calls of my AI projects. It picks a small or a lar
 back when a model fails or stalls, caches responses so that re-running an evaluation costs almost nothing,
 records what every call cost, and stops when a budget is spent.
 
-**Status: design.** No code is merged yet. The plan is in [docs/design.md](docs/design.md), the choices behind it
-in [docs/decisions.md](docs/decisions.md), and the work is tracked in the
-[v0.1 milestone](https://github.com/0103juan/model-gateway/milestone/1).
+**Status: in progress.** [Working today](#working-today) lists what is merged. The plan is in
+[docs/design.md](docs/design.md), the choices behind it in [docs/decisions.md](docs/decisions.md), and the work
+is tracked in the [v0.1 milestone](https://github.com/0103juan/model-gateway/milestone/1).
 
 ## Why
 
@@ -40,6 +40,17 @@ response = gateway.create(task="generate", system="...", messages=[...])
 
 v0.1 is done when two repositories use it and their READMEs report the cost and the answer quality of the small
 model against the large one on the same evaluation set.
+
+## Working today
+
+- **Routing by task.** `Gateway(client, routes={"rewrite": "small"})` sends the `rewrite` task to Claude Haiku 4.5
+  and every other task to Claude Sonnet 5.5. A setting the chosen model rejects (`output_config.effort` on Haiku
+  4.5) is removed from the request.
+
+```
+uv sync
+uv run pytest
+```
 
 ## Not in v0.1
 

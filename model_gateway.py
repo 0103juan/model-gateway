@@ -1,18 +1,22 @@
 """One entry point for model calls. The caller names the task; a table decides which model runs it and which
-one takes over if it fails, every call leaves a record of what it cost, and a key that has spent its budget
-gets no more calls.
+one takes over if it fails, a request already answered is served from disk, every call leaves a record of
+what it cost, and a key that has spent its budget gets no more calls.
 
     gateway = Gateway(anthropic.Anthropic(), routes={"rewrite": ["small", "large"]}, key="eval", budget_usd=1.00,
-                      ledger="ledger.jsonl", timeout=60)
+                      ledger="ledger.jsonl", cache=".gateway/cache", timeout=60)
     response = gateway.parse(task="rewrite", system=..., messages=[...], output_format=Rewrite)
     gateway.calls[-1]["usd"]
 """
 
+import hashlib
 import json
 import time
 from pathlib import Path
 
 import anthropic
+from anthropic.types.beta import BetaMessage
+from anthropic.types.beta.parsed_beta_message import ParsedBetaMessage
+from pydantic import TypeAdapter
 
 # A tier is a model plus the request settings that model needs.
 # A safety decline on the large model is re-run server-side on Anthropic's recommended fallback model.
@@ -36,6 +40,7 @@ USD_PER_MTOK = {
     "claude-sonnet-4-6": (3.00, 15.00),
     "claude-haiku-4-5": (1.00, 5.00),
 }
+UNFINISHED = {"refusal", "max_tokens", "pause_turn"}  # stop reasons of a response that is not worth keeping
 
 
 def build_request(tier: str, request: dict) -> dict:
@@ -62,6 +67,25 @@ def cost(response) -> dict:
             "usd": (tokens_in * usd_in + usage.output_tokens * usd_out) / 1e6}
 
 
+def fingerprint(method: str, params: dict) -> str:
+    """A hash of everything that decides the answer: the method, the model and the whole request."""
+    def plain(value):  # output_format is a class; what the model sees of it is its JSON schema
+        return TypeAdapter(value).json_schema() if isinstance(value, type) else repr(value)
+    return hashlib.sha256(json.dumps([method, params], sort_keys=True, default=plain).encode()).hexdigest()
+
+
+def restore(path: Path, output_format=None):
+    """A stored response as the object the SDK returned the first time, with parsed_output rebuilt."""
+    raw = path.read_text(encoding="utf-8")
+    if output_format is None:
+        return BetaMessage.model_validate_json(raw)
+    message = ParsedBetaMessage[output_format].model_validate_json(raw)
+    for block in message.content:
+        if block.type == "text":
+            block.parsed_output = TypeAdapter(output_format).validate_json(block.text)
+    return message
+
+
 class BudgetExceeded(RuntimeError):
     """The key has spent its budget. The model was not called."""
 
@@ -70,7 +94,8 @@ class Gateway:
     """Takes the arguments of client.beta.messages.create and .parse, plus the task, and returns the SDK's response."""
 
     def __init__(self, client, routes: dict[str, str | list[str]] | None = None, *, key: str = "default",
-                 budget_usd: float | None = None, ledger: str | Path | None = None, timeout: float | None = None):
+                 budget_usd: float | None = None, ledger: str | Path | None = None,
+                 cache: str | Path | None = None, timeout: float | None = None):
         self.client = client
         # A route is the tier to use and, after it, the tiers to fall back to, in order.
         self.routes = {task: [route] if isinstance(route, str) else list(route)
@@ -79,6 +104,9 @@ class Gateway:
         if unknown or [] in self.routes.values():
             raise ValueError(f"a route needs at least one of the tiers {sorted(TIERS)}; unknown: {sorted(unknown)}")
         self.timeout = timeout  # seconds per attempt; the SDK retries a timeout before the gateway falls back
+        self.cache = Path(cache) if cache else None  # a folder with one JSON file per request
+        if self.cache:
+            self.cache.mkdir(parents=True, exist_ok=True)
         self.key = key  # who is spending: a run, a project, a user
         self.calls: list[dict] = []  # one record per call made through this gateway
         self.ledger = Path(ledger) if ledger else None
@@ -105,8 +133,12 @@ class Gateway:
         client = self.client.with_options(timeout=self.timeout) if self.timeout else self.client
         start = time.perf_counter()
         for position, tier in enumerate(tiers):
+            params = build_request(tier, request)
+            stored = self.cache / f"{fingerprint(method, params)}.json" if self.cache else None
+            cached = stored is not None and stored.exists()
             try:
-                response = getattr(client.beta.messages, method)(**build_request(tier, request))
+                response = (restore(stored, params.get("output_format")) if cached
+                            else getattr(client.beta.messages, method)(**params))
             except (anthropic.RateLimitError, anthropic.APIConnectionError) as error:  # 429, no connection, timeout
                 failure = error
             except anthropic.APIStatusError as error:
@@ -114,8 +146,11 @@ class Gateway:
                     raise
                 failure = error
             else:
-                self._record({"task": task, "tier": tier, **cost(response), "fallback": position > 0,
-                              "ms": round((time.perf_counter() - start) * 1000)})
+                if stored and not cached and response.stop_reason not in UNFINISHED:
+                    stored.write_text(response.to_json(), encoding="utf-8")
+                call = {"task": task, "tier": tier, **cost(response), "fallback": position > 0, "cached": cached,
+                        "ms": round((time.perf_counter() - start) * 1000)}
+                self._record({**call, "usd": 0.0} if cached else call)  # a hit keeps its tokens: what was saved
                 return response
         raise failure
 

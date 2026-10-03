@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import anthropic
 import httpx2
 import pytest
+from pydantic import BaseModel
 
 from model_gateway import BudgetExceeded, Gateway, cost
 
@@ -204,3 +205,61 @@ def test_the_timeout_applies_to_each_attempt():
 def test_a_route_without_tiers_fails_at_construction():
     with pytest.raises(ValueError):
         Gateway(fake_client(), routes={"rewrite": []})
+
+
+class Rewrite(BaseModel):
+    standalone: str
+
+
+def sdk_client(stop_reason="end_turn"):
+    """The real SDK over a fake HTTP transport, so the cache stores and restores real response objects."""
+    bodies = []
+
+    def api(request):
+        bodies.append(json.loads(request.content))
+        return httpx2.Response(200, json={
+            "id": f"msg_{len(bodies)}", "type": "message", "role": "assistant", "model": bodies[-1]["model"],
+            "stop_reason": stop_reason, "stop_sequence": None, "usage": {"input_tokens": 1000, "output_tokens": 100},
+            "content": [{"type": "text", "text": '{"standalone": "hotel cap"}'}]})
+
+    http = anthropic.DefaultHttpxClient(transport=httpx2.MockTransport(api))
+    return anthropic.Anthropic(api_key="test", http_client=http), bodies
+
+
+def ask(gateway, question="hotel cap?", **request):
+    return gateway.parse(task="rewrite", messages=[{"role": "user", "content": question}],
+                         output_format=Rewrite, **request)
+
+
+def test_a_repeated_request_is_served_from_disk_at_no_cost(tmp_path):
+    client, bodies = sdk_client()
+    first = ask(Gateway(client, cache=tmp_path))
+    gateway = Gateway(client, cache=tmp_path)  # a later run
+    again = ask(gateway)
+
+    assert len(bodies) == 1 and again.id == first.id
+    assert again.parsed_output == first.parsed_output == Rewrite(standalone="hotel cap")
+    assert gateway.calls[0]["cached"] and gateway.calls[0]["usd"] == 0 and gateway.calls[0]["input_tokens"] == 1000
+    assert gateway.create(task="rewrite", messages=[{"role": "user", "content": "hotel cap?"}]).id == "msg_2"
+    assert gateway.create(task="rewrite", messages=[{"role": "user", "content": "hotel cap?"}]).id == "msg_2"
+
+
+def test_any_change_in_the_request_misses_the_cache(tmp_path):
+    client, bodies = sdk_client()
+    gateway = Gateway(client, routes={"cheap": "small"}, cache=tmp_path)
+    ask(gateway)
+    ask(gateway, question="hotel limit?")
+    ask(gateway, system="Be brief.")
+    gateway.parse(task="cheap", messages=[{"role": "user", "content": "hotel cap?"}], output_format=Rewrite)
+
+    assert len(bodies) == 4 and not any(call["cached"] for call in gateway.calls)
+
+
+@pytest.mark.parametrize("stop_reason", ["refusal", "max_tokens"])
+def test_an_unfinished_response_is_not_stored(tmp_path, stop_reason):
+    client, bodies = sdk_client(stop_reason)
+    gateway = Gateway(client, cache=tmp_path)
+    gateway.create(task="generate", messages=[{"role": "user", "content": "hi"}])
+    gateway.create(task="generate", messages=[{"role": "user", "content": "hi"}])
+
+    assert len(bodies) == 2 and list(tmp_path.iterdir()) == []

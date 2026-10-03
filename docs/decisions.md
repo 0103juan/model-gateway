@@ -53,3 +53,13 @@ starts after that, so with `timeout=60` the worst case before the next tier is t
 A fallback from the large model to the small one changes the quality of the answer without telling the caller.
 That is why no route falls back unless it lists a second tier, and why the record of every call says which
 model answered and whether it was a fallback.
+
+## 2026-10-03 · The cache key is the whole request, and entries do not expire
+
+The cache exists so that re-running an evaluation that did not change is free. Any difference in the request
+(model, prompt, schema, a setting) is a different key, so a stale answer can only come from the same question
+asked the same way. Nothing expires: the entries are files, and deleting the folder is the invalidation.
+
+The cost is that the same request always gets the same answer. A caller that wants several samples of one
+prompt has to leave the cache off for that call path. A refusal or a truncated response is not stored, because
+the next attempt may do better.

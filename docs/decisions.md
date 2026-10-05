@@ -42,3 +42,14 @@ Haiku 4.5 rejects a request that carries `output_config.effort`, according to th
 not been tried against the API yet. The callers set an effort per stage and should not have to know which model
 a route points to, so the gateway drops the setting for that model. The list of such settings lives next to the
 tiers, in one place.
+
+## 2026-10-03 · Fall back only on a failure another model can fix
+
+A rate limit, a server error or a timeout says nothing about the request, so the next tier may well answer it. A
+400 or a 404 is a mistake in the request or in the tier table: sending it to a second model would hide the
+mistake. The gateway does not retry on its own. The SDK already retries twice with backoff, and the fallback
+starts after that, so with `timeout=60` the worst case before the next tier is three minutes.
+
+A fallback from the large model to the small one changes the quality of the answer without telling the caller.
+That is why no route falls back unless it lists a second tier, and why the record of every call says which
+model answered and whether it was a fallback.

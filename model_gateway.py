@@ -1,8 +1,9 @@
-"""One entry point for model calls. The caller names the task; a table decides which model runs it,
-every call leaves a record of what it cost, and a key that has spent its budget gets no more calls.
+"""One entry point for model calls. The caller names the task; a table decides which model runs it and which
+one takes over if it fails, every call leaves a record of what it cost, and a key that has spent its budget
+gets no more calls.
 
-    gateway = Gateway(anthropic.Anthropic(), routes={"rewrite": "small"}, key="eval", budget_usd=1.00,
-                      ledger="ledger.jsonl")
+    gateway = Gateway(anthropic.Anthropic(), routes={"rewrite": ["small", "large"]}, key="eval", budget_usd=1.00,
+                      ledger="ledger.jsonl", timeout=60)
     response = gateway.parse(task="rewrite", system=..., messages=[...], output_format=Rewrite)
     gateway.calls[-1]["usd"]
 """
@@ -10,6 +11,8 @@ every call leaves a record of what it cost, and a key that has spent its budget 
 import json
 import time
 from pathlib import Path
+
+import anthropic
 
 # A tier is a model plus the request settings that model needs.
 # A safety decline on the large model is re-run server-side on Anthropic's recommended fallback model.
@@ -66,13 +69,16 @@ class BudgetExceeded(RuntimeError):
 class Gateway:
     """Takes the arguments of client.beta.messages.create and .parse, plus the task, and returns the SDK's response."""
 
-    def __init__(self, client, routes: dict[str, str] | None = None, *, key: str = "default",
-                 budget_usd: float | None = None, ledger: str | Path | None = None):
+    def __init__(self, client, routes: dict[str, str | list[str]] | None = None, *, key: str = "default",
+                 budget_usd: float | None = None, ledger: str | Path | None = None, timeout: float | None = None):
         self.client = client
-        self.routes = routes or {}
-        unknown = set(self.routes.values()) - TIERS.keys()
-        if unknown:
-            raise ValueError(f"unknown tiers in routes: {sorted(unknown)}; the tiers are {sorted(TIERS)}")
+        # A route is the tier to use and, after it, the tiers to fall back to, in order.
+        self.routes = {task: [route] if isinstance(route, str) else list(route)
+                       for task, route in (routes or {}).items()}
+        unknown = {tier for tiers in self.routes.values() for tier in tiers} - TIERS.keys()
+        if unknown or [] in self.routes.values():
+            raise ValueError(f"a route needs at least one of the tiers {sorted(TIERS)}; unknown: {sorted(unknown)}")
+        self.timeout = timeout  # seconds per attempt; the SDK retries a timeout before the gateway falls back
         self.key = key  # who is spending: a run, a project, a user
         self.calls: list[dict] = []  # one record per call made through this gateway
         self.ledger = Path(ledger) if ledger else None
@@ -95,12 +101,23 @@ class Gateway:
         # two processes share it. Reserve an estimate from count_tokens if a hard ceiling is ever needed.
         if self.budget_usd is not None and self.spent >= self.budget_usd:
             raise BudgetExceeded(f"key {self.key!r} has spent ${self.spent:.4f} of its ${self.budget_usd:.2f} budget")
-        tier =self.routes.get(task, "large")  # a task nobody has measured on the small model stays on the large one
+        tiers = self.routes.get(task, ["large"])  # a task nobody has measured on the small model stays on the large one
+        client = self.client.with_options(timeout=self.timeout) if self.timeout else self.client
         start = time.perf_counter()
-        response = getattr(self.client.beta.messages, method)(**build_request(tier, request))
-        self._record({"task": task, "tier": tier, **cost(response),
-                      "ms": round((time.perf_counter() - start) * 1000)})
-        return response
+        for position, tier in enumerate(tiers):
+            try:
+                response = getattr(client.beta.messages, method)(**build_request(tier, request))
+            except (anthropic.RateLimitError, anthropic.APIConnectionError) as error:  # 429, no connection, timeout
+                failure = error
+            except anthropic.APIStatusError as error:
+                if error.status_code < 500:  # a request the API rejects would be rejected on any model
+                    raise
+                failure = error
+            else:
+                self._record({"task": task, "tier": tier, **cost(response), "fallback": position > 0,
+                              "ms": round((time.perf_counter() - start) * 1000)})
+                return response
+        raise failure
 
     def _record(self, call: dict) -> None:
         call = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "key": self.key, **call}

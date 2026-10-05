@@ -52,6 +52,10 @@ model against the large one on the same evaluation set.
   `BudgetExceeded` instead of calling the model once the key has spent a dollar. The spend of a key is the sum of
   its ledger lines, so the limit holds across runs. The check runs before each call: a key can overshoot by one
   call.
+- **Fallback.** A route can be a list, `{"rewrite": ["small", "large"]}`. On a rate limit, a server error, a
+  dropped connection or a timeout, after the SDK's own retries, the next tier takes the call, and the record
+  says `fallback: true`. A request the API rejects is raised without trying another model. `timeout=60` sets
+  the seconds each attempt may take.
 
 ```
 uv sync

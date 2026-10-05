@@ -46,6 +46,8 @@ model against the large one on the same evaluation set.
 - **Routing by task.** `Gateway(client, routes={"rewrite": "small"})` sends the `rewrite` task to Claude Haiku 4.5
   and every other task to Claude Sonnet 5.5. A setting the chosen model rejects (`output_config.effort` on Haiku
   4.5) is removed from the request.
+- **Cost per call.** `gateway.calls` holds one record per call: key, task, tier, the model that answered, tokens,
+  USD at list price and milliseconds. With `ledger="ledger.jsonl"` each record is also appended to that file.
 
 ```
 uv sync

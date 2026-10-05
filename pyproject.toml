@@ -1,6 +1,6 @@
 [project]
 name = "model-gateway"
-version = "0.0.0"
+version = "0.1.0"
 description = "One entry point for LLM calls: routing between a small and a large model, fallback, response cache, cost per call and a budget per key"
 readme = "README.md"
 license = "MIT"

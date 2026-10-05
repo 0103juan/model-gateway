@@ -38,8 +38,9 @@ consumers in the same account, so a PyPI name would be publishing for its own sa
 
 ## 2026-10-03 · A setting the model rejects is removed, not raised
 
-Haiku 4.5 rejects a request that carries `output_config.effort`, according to the API documentation; this has
-not been tried against the API yet. The callers set an effort per stage and should not have to know which model
+Haiku 4.5 rejects a request that carries `output_config.effort`, according to the API documentation. In the first
+real run (3 October, 105 calls to Haiku) the requests went without it and were accepted; sending it was not
+tried. The callers set an effort per stage and should not have to know which model
 a route points to, so the gateway drops the setting for that model. The list of such settings lives next to the
 tiers, in one place.
 
@@ -63,3 +64,12 @@ asked the same way. Nothing expires: the entries are files, and deleting the fol
 The cost is that the same request always gets the same answer. A caller that wants several samples of one
 prompt has to leave the cache off for that call path. A refusal or a truncated response is not stored, because
 the next attempt may do better.
+
+## 2026-10-03 · After the first measurement, no route defaults to the small model
+
+The evaluation of `consultor-tributario` ran on both tiers. The small tier cost 62% less for the pipeline and
+scored one question lower, which is inside the difference between two runs of the large tier. That is not
+enough to move work to it by default: the small model ignored the "exactly this sentence" instruction for
+abstentions, and as a judge it audited the opposite of two negative sentences. Both are defects the consumer
+can fix in code. The gateway keeps `large` as the route for any task not named, and each consumer moves a task
+to `small` when its own evaluation supports it.

@@ -1,0 +1,20 @@
+[project]
+name = "model-gateway"
+version = "0.0.0"
+description = "One entry point for LLM calls: routing between a small and a large model, fallback, response cache, cost per call and a budget per key"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic>=1.11",
+]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+only-include = ["model_gateway.py"]

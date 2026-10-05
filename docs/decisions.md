@@ -35,3 +35,10 @@ processes sharing a key can each overspend by the calls in flight.
 
 `pip install git+https://github.com/0103juan/model-gateway@v0.1.0`. The package has one author and five
 consumers in the same account, so a PyPI name would be publishing for its own sake.
+
+## 2026-10-03 · A setting the model rejects is removed, not raised
+
+Haiku 4.5 rejects a request that carries `output_config.effort`, according to the API documentation; this has
+not been tried against the API yet. The callers set an effort per stage and should not have to know which model
+a route points to, so the gateway drops the setting for that model. The list of such settings lives next to the
+tiers, in one place.

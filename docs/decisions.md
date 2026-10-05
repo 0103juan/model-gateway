@@ -38,7 +38,38 @@ consumers in the same account, so a PyPI name would be publishing for its own sa
 
 ## 2026-10-03 · A setting the model rejects is removed, not raised
 
-Haiku 4.5 rejects a request that carries `output_config.effort`, according to the API documentation; this has
-not been tried against the API yet. The callers set an effort per stage and should not have to know which model
+Haiku 4.5 rejects a request that carries `output_config.effort`, according to the API documentation. In the first
+real run (3 October, 105 calls to Haiku) the requests went without it and were accepted; sending it was not
+tried. The callers set an effort per stage and should not have to know which model
 a route points to, so the gateway drops the setting for that model. The list of such settings lives next to the
 tiers, in one place.
+
+## 2026-10-03 · Fall back only on a failure another model can fix
+
+A rate limit, a server error or a timeout says nothing about the request, so the next tier may well answer it. A
+400 or a 404 is a mistake in the request or in the tier table: sending it to a second model would hide the
+mistake. The gateway does not retry on its own. The SDK already retries twice with backoff, and the fallback
+starts after that, so with `timeout=60` the worst case before the next tier is three minutes.
+
+A fallback from the large model to the small one changes the quality of the answer without telling the caller.
+That is why no route falls back unless it lists a second tier, and why the record of every call says which
+model answered and whether it was a fallback.
+
+## 2026-10-03 · The cache key is the whole request, and entries do not expire
+
+The cache exists so that re-running an evaluation that did not change is free. Any difference in the request
+(model, prompt, schema, a setting) is a different key, so a stale answer can only come from the same question
+asked the same way. Nothing expires: the entries are files, and deleting the folder is the invalidation.
+
+The cost is that the same request always gets the same answer. A caller that wants several samples of one
+prompt has to leave the cache off for that call path. A refusal or a truncated response is not stored, because
+the next attempt may do better.
+
+## 2026-10-03 · After the first measurement, no route defaults to the small model
+
+The evaluation of `consultor-tributario` ran on both tiers. The small tier cost 62% less for the pipeline and
+scored one question lower, which is inside the difference between two runs of the large tier. That is not
+enough to move work to it by default: the small model ignored the "exactly this sentence" instruction for
+abstentions, and as a judge it audited the opposite of two negative sentences. Both are defects the consumer
+can fix in code. The gateway keeps `large` as the route for any task not named, and each consumer moves a task
+to `small` when its own evaluation supports it.

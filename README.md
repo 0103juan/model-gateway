@@ -53,6 +53,69 @@ gateway three times:
   questions, is in the
   [consumer's README](https://github.com/0103juan/consultor-tributario#small-model-against-large-model).
 
+## See it
+
+`console.py` draws the gateway as a tree and lets you talk to four agents from one prompt. An agent is a name,
+a task and a system prompt; the gateway picks the model for the task. Each agent keeps its own conversation:
+`@explorer <message>` talks to one, plain text goes to the one you last addressed.
+
+```
+uv run console.py --fake      # no key, no cost: canned answers through the real gateway
+uv run console.py             # needs ANTHROPIC_API_KEY; the key "console" may spend $0.25 across runs
+```
+
+The screen after four messages in fake mode (the second one repeats the first, so it comes from the cache):
+
+```
+MODEL GATEWAY  ·  ■ large claude-sonnet-5-5  ■ small claude-haiku-4-5  ■ router  ■ key
+══════════════════════════════════════════════════════════════════════════════════════════
+FAKE MODE · no model is called · the amounts are what these tokens would have cost
+┌───── KEY · fake ─────┐                   ┌────────────────────────────┐
+│ budget         $0.25 │                   │            main            │
+│ spent        $0.0007 │                   │     claude-sonnet-5-5      │
+│ ░░░░░░░░░░░░░░   0%  │                   │      plans + answers       │
+│ all runs of this key │                   │      $2 / $10 per 1M       │
+│                      │                   │          ● 1 turn          │
+│ once spent, the      │                   └────────────────────────────┘
+│ gateway stops before │                                  │
+│ calling the model    │  ┌────────────────── GATEWAY · route by task ───────────────────┐
+│                      │  │ plan      large          ███░░░░░ $0.0003   1 call  0 cached │
+│ this session         │  │ write     large → small  ███░░░░░ $0.0003   1 call  0 cached │
+│ calls              4 │  │ explore   small → large  ██░░░░░░ $0.0002  2 calls  1 cached │
+│ from cache         1 │  │ research  small → large  ░░░░░░░░ $0.0000  0 calls  0 cached │
+│ fallbacks          0 │  │ no route → large · fallbacks on 429, 5xx, timeout: 0         │
+│ tokens in        268 │  └──────────────────────────────────────────────────────────────┘
+│ tokens out        66 │            ┌─────────────────────┼─────────────────────┐
+│                      │            ▼                     ▼                     ▼
+│ last call            │  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐
+│ write → large        │  │     worker ◂     │  │     explorer     │  │    researcher    │
+│ 1 ms  $0.0003        │  │claude-sonnet-5-5 │  │ claude-haiku-4-5 │  │ claude-haiku-4-5 │
+│                      │  │ writes the code  │  │  explains code   │  │   sums up text   │
+│                      │  │ $2 / $10 per 1M  │  │  $1 / $5 per 1M  │  │  $1 / $5 per 1M  │
+│                      │  │     ● 1 turn     │  │     ● 1 turn     │  │      ○ idle      │
+│                      │  └──────────────────┘  └──────────────────┘  └──────────────────┘
+│                      │            └─────────────────────┼─────────────────────┘
+│                      │                                  ▼
+│                      │           ┌────────── every call is recorded ──────────┐
+│                      │           │ ledger  off                                │
+│                      │           │ cache   tmphwhicfjk · 1 hit                │
+└──────────────────────┘           └────────────────────────────────────────────┘
+┌───────────────────────────────────── session log ──────────────────────────────────────┐
+│ 02:10:00  explorer   explore → small claude-haiku-4-5  61+18 tok  $0.0002  39 ms       │
+│ 02:10:00  explorer   explore → small claude-haiku-4-5  61+18 tok  $0.0000  1 ms cached │
+│ 02:10:00  main       plan → large claude-sonnet-5-5  80+15 tok  $0.0003  1 ms          │
+│ 02:10:00  worker     write → large claude-sonnet-5-5  66+15 tok  $0.0003  1 ms         │
+└────────────────────────────────────────────────────────────────────────────────────────┘
+
+you ›
+write a retry loop
+
+worker ›
+(fake answer, no model was called) You said: write a retry loop
+
+@main @worker @explorer @researcher  ·  /clear  ·  /quit
+```
+
 ## What it does
 
 - **Routing by task.** `routes` maps a task to a tier. `small` is Claude Haiku 4.5 and `large` is Claude Sonnet
@@ -80,7 +143,7 @@ To work on it:
 
 ```
 uv sync
-uv run pytest     # 28 tests, no API key; the cache tests run the real SDK over a fake HTTP transport
+uv run pytest     # 32 tests, no API key; the cache tests run the real SDK over a fake HTTP transport
 ```
 
 ## Limits
@@ -95,6 +158,8 @@ uv run pytest     # 28 tests, no API key; the cache tests run the real SDK over 
   samples of one prompt has to leave the cache off.
 - That Haiku 4.5 rejects `output_config.effort` comes from the API documentation. The gateway removes the
   setting and those requests were accepted; sending it was not tried.
+- **The console has only run in fake mode.** Its agents are conversations: they have no tools, do not call each
+  other and do not stream; the screen is redrawn after each answer.
 - Sync `create` and `parse` only. Async clients, streaming and the SDK's tool runner are not covered, so the two
   MCP chat clients and the agent do not use the gateway yet
   ([#10](https://github.com/0103juan/model-gateway/issues/10)).

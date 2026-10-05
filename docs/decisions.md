@@ -73,3 +73,14 @@ enough to move work to it by default: the small model ignored the "exactly this 
 abstentions, and as a judge it audited the opposite of two negative sentences. Both are defects the consumer
 can fix in code. The gateway keeps `large` as the route for any task not named, and each consumer moves a task
 to `small` when its own evaluation supports it.
+
+## 2026-10-05 · The tool runner is the SDK's, with the gateway inside it
+
+An agent loop needs the same steps on every turn: route, cache, fall back, record, stop at the budget. Writing
+a loop of our own would mean keeping up with what the SDK's runner already does (running the tools, resuming a
+paused turn, compaction). Instead `tool_runner` builds the SDK's runner and replaces the client it sends each
+turn to with the gateway. The runner has no public hook for that, so the gateway sets a private attribute. The
+cost is that a new SDK release can break it; the tests run the real runner and would say so.
+
+The sync and the async gateway share one generator that holds every step except the sending, so the two
+cannot drift apart.

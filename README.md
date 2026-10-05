@@ -56,6 +56,9 @@ model against the large one on the same evaluation set.
   dropped connection or a timeout, after the SDK's own retries, the next tier takes the call, and the record
   says `fallback: true`. A request the API rejects is raised without trying another model. `timeout=60` sets
   the seconds each attempt may take.
+- **Response cache.** With `cache=".gateway/cache"` a request that was already answered is read from disk: the
+  record says `cached: true` and costs nothing. The key is a hash of the whole request, model included, so any
+  change misses. A refusal or a truncated response is not stored. Delete the folder to start over.
 
 ```
 uv sync

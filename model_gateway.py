@@ -1,7 +1,8 @@
 """One entry point for model calls. The caller names the task; a table decides which model runs it,
-and every call leaves a record of what it cost.
+every call leaves a record of what it cost, and a key that has spent its budget gets no more calls.
 
-    gateway = Gateway(anthropic.Anthropic(), routes={"rewrite": "small"}, ledger="ledger.jsonl")
+    gateway = Gateway(anthropic.Anthropic(), routes={"rewrite": "small"}, key="eval", budget_usd=1.00,
+                      ledger="ledger.jsonl")
     response = gateway.parse(task="rewrite", system=..., messages=[...], output_format=Rewrite)
     gateway.calls[-1]["usd"]
 """
@@ -58,11 +59,15 @@ def cost(response) -> dict:
             "usd": (tokens_in * usd_in + usage.output_tokens * usd_out) / 1e6}
 
 
+class BudgetExceeded(RuntimeError):
+    """The key has spent its budget. The model was not called."""
+
+
 class Gateway:
     """Takes the arguments of client.beta.messages.create and .parse, plus the task, and returns the SDK's response."""
 
     def __init__(self, client, routes: dict[str, str] | None = None, *, key: str = "default",
-                 ledger: str | Path | None = None):
+                 budget_usd: float | None = None, ledger: str | Path | None = None):
         self.client = client
         self.routes = routes or {}
         unknown = set(self.routes.values()) - TIERS.keys()
@@ -71,8 +76,13 @@ class Gateway:
         self.key = key  # who is spending: a run, a project, a user
         self.calls: list[dict] = []  # one record per call made through this gateway
         self.ledger = Path(ledger) if ledger else None
+        self.budget_usd = budget_usd
+        self.spent = 0.0  # USD spent by this key, counting earlier runs when there is a ledger
         if self.ledger:
             self.ledger.parent.mkdir(parents=True, exist_ok=True)
+            if self.ledger.exists():
+                lines = map(json.loads, self.ledger.read_text(encoding="utf-8").splitlines())
+                self.spent = sum(line["usd"] for line in lines if line["key"] == key)
 
     def create(self, task: str, **request):
         return self._call("create", task, request)
@@ -81,7 +91,11 @@ class Gateway:
         return self._call("parse", task, request)
 
     def _call(self, method: str, task: str, request: dict):
-        tier = self.routes.get(task, "large")  # a task nobody has measured on the small model stays on the large one
+        # ponytail: checked before the call, so a key can overshoot by one call, and by the calls in flight when
+        # two processes share it. Reserve an estimate from count_tokens if a hard ceiling is ever needed.
+        if self.budget_usd is not None and self.spent >= self.budget_usd:
+            raise BudgetExceeded(f"key {self.key!r} has spent ${self.spent:.4f} of its ${self.budget_usd:.2f} budget")
+        tier =self.routes.get(task, "large")  # a task nobody has measured on the small model stays on the large one
         start = time.perf_counter()
         response = getattr(self.client.beta.messages, method)(**build_request(tier, request))
         self._record({"task": task, "tier": tier, **cost(response),
@@ -91,6 +105,7 @@ class Gateway:
     def _record(self, call: dict) -> None:
         call = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "key": self.key, **call}
         self.calls.append(call)
+        self.spent += call["usd"]
         if self.ledger:
             with self.ledger.open("a", encoding="utf-8") as file:
                 file.write(json.dumps(call) + "\n")

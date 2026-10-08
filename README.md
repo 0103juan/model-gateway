@@ -132,6 +132,15 @@ worker ›
 - **Budget per key.** With `budget_usd`, the gateway raises `BudgetExceeded` instead of calling the model once
   the key has spent its budget. The spend of a key is the sum of its ledger lines, so the limit holds across
   runs.
+- **Async and agent loops.** `AsyncGateway` is the same class over `anthropic.AsyncAnthropic`. `tool_runner`
+  takes the arguments of the SDK's `client.beta.messages.tool_runner`, plus `task`, and returns the SDK's
+  runner: every turn of the loop is routed, cached, recorded and counted against the budget like any other call.
+
+  ```python
+  gateway = AsyncGateway(anthropic.AsyncAnthropic(), routes={"agent": ["large", "small"]}, ledger="ledger.jsonl")
+  final = await gateway.tool_runner(task="agent", messages=[...], tools=[...]).until_done()
+  sum(call["usd"] for call in gateway.calls)   # what the run cost
+  ```
 
 ## Use it
 
@@ -143,7 +152,7 @@ To work on it:
 
 ```
 uv sync
-uv run pytest     # 32 tests, no API key; the cache tests run the real SDK over a fake HTTP transport
+uv run pytest     # 36 tests, no API key; the cache and tool-runner tests run the real SDK over a fake HTTP transport
 ```
 
 ## Limits
@@ -160,9 +169,12 @@ uv run pytest     # 32 tests, no API key; the cache tests run the real SDK over 
   setting and those requests were accepted; sending it was not tried.
 - **The console has only run in fake mode.** Its agents are conversations: they have no tools, do not call each
   other and do not stream; the screen is redrawn after each answer.
-- Sync `create` and `parse` only. Async clients, streaming and the SDK's tool runner are not covered, so the two
-  MCP chat clients and the agent do not use the gateway yet
-  ([#10](https://github.com/0103juan/model-gateway/issues/10)).
+- No streaming. `AsyncGateway` and `tool_runner` exist since this version, but the two MCP chat clients and the
+  agent do not use them yet ([#10](https://github.com/0103juan/model-gateway/issues/10)), and neither has run
+  against the API: the tests drive the real SDK runner over a fake HTTP transport.
+- `tool_runner` puts the gateway inside the SDK's runner by setting a private attribute of it, because the
+  runner offers no public way to change where it sends a turn. A release of the SDK can break that; the tests
+  would fail.
 - One provider. The prices are a table in the code, dated, and have to be updated by hand.
 
 The design is in [docs/design.md](docs/design.md) and the choices behind it in

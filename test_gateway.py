@@ -1,5 +1,6 @@
 """No test calls the API: a fake client records the requests it is sent."""
 
+import asyncio
 import json
 from types import SimpleNamespace
 
@@ -8,7 +9,7 @@ import httpx2
 import pytest
 from pydantic import BaseModel
 
-from model_gateway import BudgetExceeded, Gateway, cost
+from model_gateway import AsyncGateway, BudgetExceeded, Gateway, cost
 
 
 class FakeMessages:
@@ -263,3 +264,91 @@ def test_an_unfinished_response_is_not_stored(tmp_path, stop_reason):
     gateway.create(task="generate", messages=[{"role": "user", "content": "hi"}])
 
     assert len(bodies) == 2 and list(tmp_path.iterdir()) == []
+
+
+def agent_api(fail=()):
+    """A fake HTTP API for a two-turn agent: it asks for the tool `add`, then answers with what the tool returned.
+    A model named in `fail` answers 500."""
+    bodies = []
+
+    def api(request):
+        body = json.loads(request.content)
+        bodies.append({**body, "beta": request.headers.get("anthropic-beta", "")})
+        if body["model"] in fail:
+            return httpx2.Response(500, json={"type": "error", "error": {"type": "api_error", "message": "down"}})
+        last = body["messages"][-1]["content"]
+        results = [block["content"] for block in last if block["type"] == "tool_result"] if isinstance(last, list) else []
+        content = ([{"type": "text", "text": f"It is {results[0]}."}] if results else
+                   [{"type": "tool_use", "id": "toolu_1", "name": "add", "input": {"a": 2, "b": 3}}])
+        return httpx2.Response(200, json={
+            "id": f"msg_{len(bodies)}", "type": "message", "role": "assistant", "model": body["model"],
+            "stop_reason": "end_turn" if results else "tool_use", "stop_sequence": None,
+            "usage": {"input_tokens": 1000, "output_tokens": 100}, "content": content})
+
+    return httpx2.MockTransport(api), bodies
+
+
+@anthropic.beta_tool
+def add(a: int, b: int) -> str:
+    """Add two numbers."""
+    return str(a + b)
+
+
+@anthropic.beta_async_tool(name="add")
+async def add_later(a: int, b: int) -> str:
+    """Add two numbers."""
+    return str(a + b)
+
+
+QUESTION = [{"role": "user", "content": "2 + 3?"}]
+
+
+def test_every_turn_of_the_tool_runner_goes_through_the_gateway(tmp_path):
+    transport, bodies = agent_api()
+    client = anthropic.Anthropic(api_key="test", http_client=anthropic.DefaultHttpxClient(transport=transport))
+    gateway = Gateway(client, routes={"agent": "small"}, cache=tmp_path)
+    final = gateway.tool_runner(task="agent", messages=QUESTION, tools=[add]).until_done()
+
+    assert final.content[0].text == "It is 5."
+    assert [body["model"] for body in bodies] == ["claude-haiku-4-5"] * 2
+    assert [call["task"] for call in gateway.calls] == ["agent", "agent"] and gateway.spent == pytest.approx(0.003)
+
+    again = Gateway(client, routes={"agent": "small"}, cache=tmp_path)  # a later run of the same conversation
+    assert again.tool_runner(task="agent", messages=QUESTION, tools=[add]).until_done().id == final.id
+    assert len(bodies) == 2 and again.spent == 0
+
+
+def test_a_turn_of_the_tool_runner_falls_back_with_the_settings_of_the_tier_that_runs_it():
+    transport, bodies = agent_api(fail={"claude-haiku-4-5"})
+    client = anthropic.Anthropic(api_key="test", max_retries=0,
+                                 http_client=anthropic.DefaultHttpxClient(transport=transport))
+    gateway = Gateway(client, routes={"agent": ["small", "large"]})
+    gateway.tool_runner(task="agent", messages=QUESTION, tools=[add], max_tokens=500).until_done()
+
+    large = [body for body in bodies if body["model"] == "claude-sonnet-5-5"]
+    small = [body for body in bodies if body["model"] == "claude-haiku-4-5"]
+    assert len(small) == len(large) == 2 and all(call["fallback"] for call in gateway.calls)
+    assert all(body["max_tokens"] == 500 and body["fallbacks"] == "default" and "server-side-fallback" in body["beta"]
+               for body in large)
+    assert not any("fallbacks" in body or "server-side-fallback" in body["beta"] for body in small)
+
+
+def test_the_tool_runner_does_not_stream():
+    with pytest.raises(ValueError):
+        Gateway(fake_client()).tool_runner(task="agent", messages=QUESTION, tools=[add], stream=True)
+
+
+def test_the_async_gateway_awaits_calls_and_runs_the_async_tool_runner():
+    transport, bodies = agent_api(fail={"claude-haiku-4-5"})
+    client = anthropic.AsyncAnthropic(api_key="test", max_retries=0,
+                                      http_client=anthropic.DefaultAsyncHttpxClient(transport=transport))
+    gateway = AsyncGateway(client, routes={"agent": ["small", "large"]}, budget_usd=0.005)
+
+    async def run():
+        final = await gateway.tool_runner(task="agent", messages=QUESTION, tools=[add_later]).until_done()
+        with pytest.raises(BudgetExceeded):
+            await gateway.create(task="agent", messages=QUESTION)
+        return final
+
+    assert asyncio.run(run()).content[0].text == "It is 5."
+    assert [call["model"] for call in gateway.calls] == ["claude-sonnet-5-5"] * 2 and gateway.calls[0]["fallback"]

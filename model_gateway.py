@@ -6,12 +6,16 @@ what it cost, and a key that has spent its budget gets no more calls.
                       ledger="ledger.jsonl", cache=".gateway/cache", timeout=60)
     response = gateway.parse(task="rewrite", system=..., messages=[...], output_format=Rewrite)
     gateway.calls[-1]["usd"]
+
+AsyncGateway is the same over anthropic.AsyncAnthropic, and tool_runner sends every turn of an agent loop
+through the same steps.
 """
 
 import hashlib
 import json
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import anthropic
 from anthropic.types.beta import BetaMessage
@@ -124,21 +128,59 @@ class Gateway:
     def parse(self, task: str, **request):
         return self._call("parse", task, request)
 
+    def tool_runner(self, task: str, **request):
+        """client.beta.messages.tool_runner, with every turn of the loop sent through the gateway."""
+        if request.get("stream"):
+            raise ValueError("the gateway does not stream")
+        # The runner wants a model up front, and it sends betas as a header that it would keep on every tier.
+        tier = {name: value for name, value in TIERS[self._tiers(task)[0]].items() if name != "betas"}
+        runner = self.client.beta.messages.tool_runner(**{**tier, **request})
+        owned = tier.keys() - request.keys()  # the first tier's settings: a turn takes them from the tier that runs it
+
+        def turn(**params):
+            return self._call("parse", task, {name: value for name, value in params.items() if name not in owned
+                                              and not isinstance(value, (anthropic.Omit, anthropic.NotGiven))})
+
+        # ponytail: the runner has no public way to take another client, so this sets a private attribute of
+        # the SDK. The tool-runner tests drive the real runner and fail if a release renames it.
+        runner._client = SimpleNamespace(beta=SimpleNamespace(messages=SimpleNamespace(parse=turn)))
+        return runner
+
+    def _tiers(self, task: str) -> list[str]:
+        return self.routes.get(task, ["large"])  # a task nobody has measured on the small model stays on the large one
+
+    def _send(self, method: str):
+        client = self.client.with_options(timeout=self.timeout) if self.timeout else self.client
+        return getattr(client.beta.messages, method)
+
     def _call(self, method: str, task: str, request: dict):
+        plan, send = self._plan(method, task, request), self._send(method)
+        try:
+            params = next(plan)
+            while True:
+                try:
+                    response = send(**params)
+                except Exception as error:
+                    params = plan.throw(error)
+                else:
+                    params = plan.send(response)
+        except StopIteration as done:
+            return done.value
+
+    def _plan(self, method: str, task: str, request: dict):
+        """One call as a generator, so the sync and the async gateway share every step but the sending: it
+        yields each request to send and is sent the response, or thrown the error. It returns the response."""
         # ponytail: checked before the call, so a key can overshoot by one call, and by the calls in flight when
         # two processes share it. Reserve an estimate from count_tokens if a hard ceiling is ever needed.
         if self.budget_usd is not None and self.spent >= self.budget_usd:
             raise BudgetExceeded(f"key {self.key!r} has spent ${self.spent:.4f} of its ${self.budget_usd:.2f} budget")
-        tiers = self.routes.get(task, ["large"])  # a task nobody has measured on the small model stays on the large one
-        client = self.client.with_options(timeout=self.timeout) if self.timeout else self.client
         start = time.perf_counter()
-        for position, tier in enumerate(tiers):
+        for position, tier in enumerate(self._tiers(task)):
             params = build_request(tier, request)
             stored = self.cache / f"{fingerprint(method, params)}.json" if self.cache else None
             cached = stored is not None and stored.exists()
             try:
-                response = (restore(stored, params.get("output_format")) if cached
-                            else getattr(client.beta.messages, method)(**params))
+                response = restore(stored, params.get("output_format")) if cached else (yield params)
             except (anthropic.RateLimitError, anthropic.APIConnectionError) as error:  # 429, no connection, timeout
                 failure = error
             except anthropic.APIStatusError as error:
@@ -161,3 +203,22 @@ class Gateway:
         if self.ledger:
             with self.ledger.open("a", encoding="utf-8") as file:
                 file.write(json.dumps(call) + "\n")
+
+
+class AsyncGateway(Gateway):
+    """The same gateway over anthropic.AsyncAnthropic: create and parse are awaited, and tool_runner is
+    iterated with `async for`."""
+
+    async def _call(self, method: str, task: str, request: dict):
+        plan, send = self._plan(method, task, request), self._send(method)
+        try:
+            params = next(plan)
+            while True:
+                try:
+                    response = await send(**params)
+                except Exception as error:
+                    params = plan.throw(error)
+                else:
+                    params = plan.send(response)
+        except StopIteration as done:
+            return done.value

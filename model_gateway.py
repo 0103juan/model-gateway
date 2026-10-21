@@ -110,6 +110,8 @@ class Unavailable(RuntimeError):
 
 EFFORT_TO_THINKING = {"low": "LOW", "medium": "MEDIUM", "high": "HIGH", "xhigh": "HIGH", "max": "HIGH"}
 FINISH_TO_STOP = {"STOP": "end_turn", "MAX_TOKENS": "max_tokens"}  # any other reason (safety, recitation...) declines
+# Retried, then a reason to try another tier: timeout, rate limit, cancelled by the server; and every 5xx.
+RETRIED = (408, 429, 499, 500, 502, 503, 504)
 
 
 class GeminiClient:
@@ -165,14 +167,15 @@ class GeminiClient:
             response_schema=output_format,
             # Retried here before the gateway moves to another tier, as the Anthropic SDK does (three attempts).
             http_options=types.HttpOptions(timeout=int(self._timeout * 1000) if self._timeout else None,
-                                           retry_options=types.HttpRetryOptions(attempts=self._attempts, max_delay=60)))
+                                           retry_options=types.HttpRetryOptions(attempts=self._attempts, max_delay=60,
+                                                                                http_status_codes=list(RETRIED))))
         contents = [types.Content(role="model" if message["role"] == "assistant" else "user",
                                   parts=[types.Part(text=text) for text in texts(message["content"])])
                     for message in request["messages"]]
         try:
             response = self._genai.models.generate_content(model=request["model"], contents=contents, config=config)
         except errors.APIError as error:
-            if error.code == 429 or error.code >= 500:
+            if error.code in RETRIED or error.code >= 500:
                 raise Unavailable(f"{request['model']}: {error.code} {error.message}") from error
             raise
         except httpx.TransportError as error:  # no connection, timeout

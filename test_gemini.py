@@ -66,8 +66,9 @@ def test_parse_returns_the_model_and_none_when_the_answer_does_not_fit():
     assert response.parsed_output is None and response.stop_reason == "max_tokens"
 
 
-def test_a_rate_limit_falls_back_to_the_next_tier_and_a_bad_request_does_not():
-    limited = errors.ClientError(429, {"error": {"code": 429, "message": "quota", "status": "RESOURCE_EXHAUSTED"}})
+@pytest.mark.parametrize("code, status", [(429, "RESOURCE_EXHAUSTED"), (499, "CANCELLED")])
+def test_a_rate_limit_falls_back_to_the_next_tier_and_a_bad_request_does_not(code, status):
+    limited = errors.ClientError(code, {"error": {"code": code, "message": "quota", "status": status}})
     client, models = gemini(fails={"gemini-3.5-flash-lite": limited})
     gateway = Gateway(client, tiers=GEMINI_TIERS, routes={"answer": ["small", "large"]})
     gateway.create(task="answer", messages=[{"role": "user", "content": "hola"}])

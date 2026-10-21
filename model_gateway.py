@@ -15,6 +15,7 @@ through the same steps. GeminiClient puts Gemini on Vertex AI behind the same ca
 
 import hashlib
 import json
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -213,6 +214,7 @@ class Gateway:
             self.cache.mkdir(parents=True, exist_ok=True)
         self.key = key  # who is spending: a run, a project, a user
         self.calls: list[dict] = []  # one record per call made through this gateway
+        self._lock = threading.Lock()  # threads sharing a gateway record their calls one at a time
         self.ledger = Path(ledger) if ledger else None
         self.budget_usd = budget_usd
         self.spent = 0.0  # USD spent by this key, counting earlier runs when there is a ledger
@@ -298,11 +300,12 @@ class Gateway:
 
     def _record(self, call: dict) -> None:
         call = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "key": self.key, **call}
-        self.calls.append(call)
-        self.spent += call["usd"]
-        if self.ledger:
-            with self.ledger.open("a", encoding="utf-8") as file:
-                file.write(json.dumps(call) + "\n")
+        with self._lock:  # without it, concurrent appends on Windows interleave and leave broken lines
+            self.calls.append(call)
+            self.spent += call["usd"]
+            if self.ledger:
+                with self.ledger.open("a", encoding="utf-8") as file:
+                    file.write(json.dumps(call) + "\n")
 
 
 class AsyncGateway(Gateway):

@@ -159,7 +159,9 @@ class GeminiClient:
             thinking_config=types.ThinkingConfig(thinking_level=EFFORT_TO_THINKING[effort]) if effort else None,
             response_mime_type="application/json" if output_format else None,
             response_schema=output_format,
-            http_options=types.HttpOptions(timeout=int(self._timeout * 1000)) if self._timeout else None)
+            # Retried here before the gateway moves to another tier, as the Anthropic SDK does (three attempts).
+            http_options=types.HttpOptions(timeout=int(self._timeout * 1000) if self._timeout else None,
+                                           retry_options=types.HttpRetryOptions(attempts=3)))
         contents = [types.Content(role="model" if message["role"] == "assistant" else "user",
                                   parts=[types.Part(text=text) for text in texts(message["content"])])
                     for message in request["messages"]]

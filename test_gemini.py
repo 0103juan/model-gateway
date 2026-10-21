@@ -42,6 +42,7 @@ def test_the_request_is_translated_and_thinking_counts_as_output():
     assert call["model"] == "gemini-3.5-flash-lite"
     assert call["config"].system_instruction == "Eres breve." and call["config"].max_output_tokens == 16000
     assert call["config"].thinking_config.thinking_level == types.ThinkingLevel.LOW
+    assert call["config"].http_options.retry_options.attempts == 3  # a 503 is retried before falling back
     assert [content.role for content in call["contents"]] == ["user", "model"]
     assert response.content[0].text == "hola" and response.stop_reason == "end_turn"
     assert response.usage.output_tokens == 400  # 100 answer + 300 thinking

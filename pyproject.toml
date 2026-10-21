@@ -10,6 +10,11 @@ dependencies = [
     "pydantic>=2",
 ]
 
+[project.optional-dependencies]
+gemini = [
+    "google-genai>=2.31.0",
+]
+
 [dependency-groups]
 dev = ["pytest>=8"]
 

@@ -121,15 +121,18 @@ class GeminiClient:
     ponytail: no tools, no streaming and no async client. Translate tool definitions and add a client.aio twin
     when an agent has to run on Gemini through the gateway."""
 
-    def __init__(self, project: str | None = None, location: str = "global", *, client=None, timeout: float | None = None):
+    def __init__(self, project: str | None = None, location: str = "global", *, client=None, timeout: float | None = None,
+                 attempts: int = 3):
         if client is None:
             from google import genai  # pip install "model-gateway[gemini]"
             client = genai.Client(vertexai=True, project=project, location=location)
-        self._genai, self._timeout = client, timeout
+        # attempts: tries of one call before the gateway moves on, waiting up to a minute between them. Raise
+        # it for long batch runs, where a per-minute quota is the usual 429.
+        self._genai, self._timeout, self._attempts = client, timeout, attempts
         self.beta = SimpleNamespace(messages=SimpleNamespace(create=self._create, parse=self._parse))
 
     def with_options(self, timeout: float | None = None) -> "GeminiClient":
-        return GeminiClient(client=self._genai, timeout=timeout)
+        return GeminiClient(client=self._genai, timeout=timeout, attempts=self._attempts)
 
     def _create(self, **request):
         return self._send(request, None)
@@ -162,7 +165,7 @@ class GeminiClient:
             response_schema=output_format,
             # Retried here before the gateway moves to another tier, as the Anthropic SDK does (three attempts).
             http_options=types.HttpOptions(timeout=int(self._timeout * 1000) if self._timeout else None,
-                                           retry_options=types.HttpRetryOptions(attempts=3)))
+                                           retry_options=types.HttpRetryOptions(attempts=self._attempts, max_delay=60)))
         contents = [types.Content(role="model" if message["role"] == "assistant" else "user",
                                   parts=[types.Part(text=text) for text in texts(message["content"])])
                     for message in request["messages"]]

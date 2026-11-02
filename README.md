@@ -145,7 +145,9 @@ worker ›
   changes the client and the tiers and nothing else. It returns the Anthropic SDK's own message types, which
   keeps the cache, the cost, the budget and the fallback as they are. `output_config.effort` becomes Gemini's
   thinking level; thinking tokens count as output, as Google bills them. A 429, a server error or a timeout
-  falls back to the next tier. Tools and streaming are refused, not silently dropped.
+  falls back to the next tier. Tools work as in the Messages API (`tools` with `input_schema`, `tool_use` blocks
+  back, `tool_result` blocks in); Gemini 3 wants the thought signature of a function call sent back with it, so it
+  travels inside the `tool_use` id. `tool_choice` and streaming are refused, not silently dropped.
 
   ```python
   gateway = Gateway(GeminiClient(project="my-project"), tiers=GEMINI_TIERS, routes={"rewrite": "small"})
@@ -188,7 +190,8 @@ uv run pytest     # 42 tests, no API key; the cache and tool-runner tests run th
 - `tool_runner` puts the gateway inside the SDK's runner by setting a private attribute of it, because the
   runner offers no public way to change where it sends a turn. A release of the SDK can break that; the tests
   would fail.
-- Two providers, text and structured output only on Gemini: no tools, no streaming, no async client. The
+- Two providers. Gemini has no `tool_choice`, no streaming, no async client and no `tool_runner`: an agent loop on
+  it is written by hand, as in cifras-verificables, and the tools were checked against Vertex AI only through that loop. The
   prices are a table in the code, dated, and have to be updated by hand.
 
 The design is in [docs/design.md](docs/design.md) and the choices behind it in

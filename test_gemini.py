@@ -92,7 +92,44 @@ def test_a_cached_structured_answer_comes_back_parsed_without_a_call(tmp_path):
     assert len(models.calls) == 1 and again.parsed_output == Grade(correct=False) and gateway.calls[-1]["cached"]
 
 
-def test_tools_are_refused_rather_than_dropped():
+def test_streaming_and_tool_choice_are_refused_rather_than_dropped():
     client, _ = gemini()
-    with pytest.raises(ValueError):
-        Gateway(client, tiers=GEMINI_TIERS).create(task="x", tools=[{"name": "t"}], messages=[{"role": "user", "content": "x"}])
+    for option in ({"stream": True}, {"tool_choice": {"type": "auto"}}):
+        with pytest.raises(ValueError):
+            Gateway(client, tiers=GEMINI_TIERS).create(task="x", messages=[{"role": "user", "content": "x"}], **option)
+
+
+SIGNATURE = bytes([1, 255]) + b"sig"  # not valid UTF-8, as a real one is not
+
+
+def test_a_tool_call_comes_back_as_tool_use_and_its_result_goes_in_with_the_signature():
+    call = types.Part(function_call=types.FunctionCall(name="consultar", args={"id": "abc"}), thought_signature=SIGNATURE)
+    answers = [[call], [types.Part(text="Son 12.")]]
+
+    class Models(FakeModels):
+        def generate_content(self, model, contents, config):
+            self.calls.append({"model": model, "contents": contents, "config": config})
+            return SimpleNamespace(
+                response_id="r", model_version=model, text=None,
+                candidates=[SimpleNamespace(finish_reason=types.FinishReason.STOP, content=SimpleNamespace(parts=answers[len(self.calls) - 1]))],
+                usage_metadata=SimpleNamespace(prompt_token_count=10, candidates_token_count=5, thoughts_token_count=0))
+
+    models = Models()
+    gateway = Gateway(GeminiClient(client=SimpleNamespace(models=models)), tiers=GEMINI_TIERS)
+    tools = [{"name": "consultar", "description": "Consulta.", "input_schema": {"type": "object", "properties": {"id": {"type": "string"}}}}]
+    messages = [{"role": "user", "content": "¿Cuántos?"}]
+
+    first = gateway.create(task="x", tools=tools, messages=messages)
+    declaration = models.calls[0]["config"].tools[0].function_declarations[0]
+    assert declaration.name == "consultar" and declaration.parameters_json_schema["properties"]["id"] == {"type": "string"}
+    block = first.content[0]
+    assert first.stop_reason == "tool_use" and (block.type, block.name, block.input) == ("tool_use", "consultar", {"id": "abc"})
+
+    messages += [{"role": "assistant", "content": [block.model_dump(exclude_none=True)]},
+                 {"role": "user", "content": [{"type": "tool_result", "tool_use_id": block.id, "content": "12", "is_error": False}]}]
+    second = gateway.create(task="x", tools=tools, messages=messages)
+
+    sent_call, sent_result = models.calls[1]["contents"][1].parts[0], models.calls[1]["contents"][2].parts[0]
+    assert sent_call.function_call.name == "consultar" and sent_call.thought_signature == SIGNATURE
+    assert sent_result.function_response.name == "consultar" and sent_result.function_response.response == {"output": "12"}
+    assert second.content[0].text == "Son 12." and second.stop_reason == "end_turn"

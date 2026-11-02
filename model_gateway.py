@@ -13,6 +13,7 @@ through the same steps. GeminiClient puts Gemini on Vertex AI behind the same ca
     gateway = Gateway(GeminiClient(project="my-project"), tiers=GEMINI_TIERS, routes=..., budget_usd=...)
 """
 
+import base64
 import hashlib
 import json
 import threading
@@ -120,8 +121,11 @@ class GeminiClient:
     cost and the budget work unchanged. Anthropic's output_config.effort becomes Gemini's thinking level, and
     the thinking tokens are counted as output, which is how they are billed.
 
-    ponytail: no tools, no streaming and no async client. Translate tool definitions and add a client.aio twin
-    when an agent has to run on Gemini through the gateway."""
+    Tools work as in the Messages API: `tools` with `input_schema`, `tool_use` blocks back, `tool_result` blocks in.
+    Gemini 3 wants the thought signature of a function call returned with it, and the SDK's blocks have nowhere to
+    keep it, so it travels inside the tool_use id (`<call>.<signature>`), which a caller sends back unchanged.
+
+    ponytail: no streaming and no async client. Add a client.aio twin when an agent loop has to be async on Gemini."""
 
     def __init__(self, project: str | None = None, location: str = "global", *, client=None, timeout: float | None = None,
                  attempts: int = 3):
@@ -146,15 +150,37 @@ class GeminiClient:
         import httpx
         from google.genai import errors, types
 
-        if {"tools", "tool_choice", "stream"} & request.keys():
-            raise ValueError("GeminiClient sends text and structured output only: no tools, no streaming")
+        if {"tool_choice", "stream"} & request.keys():
+            raise ValueError("GeminiClient sends text, structured output and tools only: no tool_choice, no streaming")
 
         def texts(content) -> list[str]:
             if isinstance(content, str):
                 return [content]
             if any(block.get("type") != "text" for block in content):
-                raise ValueError("GeminiClient sends text blocks only")
+                raise ValueError("a system prompt is text blocks only")
             return [block["text"] for block in content]
+
+        names: dict[str, str] = {}  # tool_use id -> function name, for the tool_result that answers it
+
+        def parts(content) -> list:
+            if isinstance(content, str):
+                return [types.Part(text=content)]
+            out = []
+            for block in content:
+                if block["type"] == "text":
+                    out.append(types.Part(text=block["text"]))
+                elif block["type"] == "tool_use":
+                    names[block["id"]] = block["name"]
+                    _, _, signature = block["id"].partition(".")
+                    out.append(types.Part(function_call=types.FunctionCall(name=block["name"], args=block["input"]),
+                                          thought_signature=base64.urlsafe_b64decode(signature) if signature else None))
+                elif block["type"] == "tool_result":
+                    body = block["content"] if isinstance(block["content"], str) else "".join(texts(block["content"]))
+                    out.append(types.Part(function_response=types.FunctionResponse(
+                        name=names[block["tool_use_id"]], response={"error" if block.get("is_error") else "output": body})))
+                else:
+                    raise ValueError(f"GeminiClient sends text and tool blocks only, not {block['type']}")
+            return out
 
         system = request.get("system")
         effort = (request.get("output_config") or {}).get("effort")
@@ -165,12 +191,15 @@ class GeminiClient:
             thinking_config=types.ThinkingConfig(thinking_level=EFFORT_TO_THINKING[effort]) if effort else None,
             response_mime_type="application/json" if output_format else None,
             response_schema=output_format,
+            tools=[types.Tool(function_declarations=[
+                types.FunctionDeclaration(name=tool["name"], description=tool.get("description"),
+                                          parameters_json_schema=tool["input_schema"]) for tool in request["tools"]])]
+            if request.get("tools") else None,
             # Retried here before the gateway moves to another tier, as the Anthropic SDK does (three attempts).
             http_options=types.HttpOptions(timeout=int(self._timeout * 1000) if self._timeout else None,
                                            retry_options=types.HttpRetryOptions(attempts=self._attempts, max_delay=60,
                                                                                 http_status_codes=list(RETRIED))))
-        contents = [types.Content(role="model" if message["role"] == "assistant" else "user",
-                                  parts=[types.Part(text=text) for text in texts(message["content"])])
+        contents = [types.Content(role="model" if message["role"] == "assistant" else "user", parts=parts(message["content"]))
                     for message in request["messages"]]
         try:
             response = self._genai.models.generate_content(model=request["model"], contents=contents, config=config)
@@ -183,11 +212,18 @@ class GeminiClient:
 
         usage = response.usage_metadata
         finish = response.candidates[0].finish_reason if response.candidates else None
-        text = response.text or ""
+        answered = getattr(getattr(response.candidates[0], "content", None), "parts", None) if response.candidates else None
+        calls = [part for part in answered or [] if part.function_call]
+        text = "".join(part.text or "" for part in answered if not part.thought) if answered else response.text or ""
+        blocks = [{"type": "text", "text": text}] if text or not calls else []
+        for i, part in enumerate(calls):
+            signature = base64.urlsafe_b64encode(part.thought_signature).decode() if part.thought_signature else ""
+            blocks.append({"type": "tool_use", "id": f"call_{i}" + (f".{signature}" if signature else ""),
+                           "name": part.function_call.name, "input": dict(part.function_call.args or {})})
         message = {"id": response.response_id or "", "type": "message", "role": "assistant",
-                   "model": response.model_version or request["model"],
-                   "content": [{"type": "text", "text": text}],
-                   "stop_reason": FINISH_TO_STOP.get(finish.name if finish else "", "refusal"), "stop_sequence": None,
+                   "model": response.model_version or request["model"], "content": blocks,
+                   "stop_reason": "tool_use" if calls else FINISH_TO_STOP.get(finish.name if finish else "", "refusal"),
+                   "stop_sequence": None,
                    "usage": {"input_tokens": usage.prompt_token_count or 0,
                              "output_tokens": (usage.candidates_token_count or 0) + (usage.thoughts_token_count or 0)}}
         if output_format is None:

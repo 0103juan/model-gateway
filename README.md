@@ -141,18 +141,33 @@ worker ›
   final = await gateway.tool_runner(task="agent", messages=[...], tools=[...]).until_done()
   sum(call["usd"] for call in gateway.calls)   # what the run cost
   ```
+- **Gemini on Vertex AI.** `GeminiClient` answers the same `create` and `parse` calls with Gemini, so a caller
+  changes the client and the tiers and nothing else. It returns the Anthropic SDK's own message types, which
+  keeps the cache, the cost, the budget and the fallback as they are. `output_config.effort` becomes Gemini's
+  thinking level; thinking tokens count as output, as Google bills them. A 429, a server error or a timeout
+  falls back to the next tier. Tools work as in the Messages API (`tools` with `input_schema`, `tool_use` blocks
+  back, `tool_result` blocks in); Gemini 3 wants the thought signature of a function call sent back with it, so it
+  travels inside the `tool_use` id. `tool_choice` and streaming are refused, not silently dropped.
+
+  ```python
+  gateway = Gateway(GeminiClient(project="my-project"), tiers=GEMINI_TIERS, routes={"rewrite": "small"})
+  ```
+
+  `small` is Gemini 3.5 Flash Lite and `large` Gemini 3.5 Flash. Checked against Vertex AI on 20 October 2026:
+  both answered `create` and `parse` with effort set, and the records priced each call at its own model.
 
 ## Use it
 
 ```
 uv add "model-gateway @ git+https://github.com/0103juan/model-gateway@v0.1.0"
+uv add "model-gateway[gemini] @ git+https://github.com/0103juan/model-gateway@<commit>"   # with GeminiClient
 ```
 
 To work on it:
 
 ```
-uv sync
-uv run pytest     # 36 tests, no API key; the cache and tool-runner tests run the real SDK over a fake HTTP transport
+uv sync --extra gemini
+uv run pytest     # 42 tests, no API key; the cache and tool-runner tests run the real SDK over a fake HTTP transport
 ```
 
 ## Limits
@@ -175,7 +190,9 @@ uv run pytest     # 36 tests, no API key; the cache and tool-runner tests run th
 - `tool_runner` puts the gateway inside the SDK's runner by setting a private attribute of it, because the
   runner offers no public way to change where it sends a turn. A release of the SDK can break that; the tests
   would fail.
-- One provider. The prices are a table in the code, dated, and have to be updated by hand.
+- Two providers. Gemini has no `tool_choice`, no streaming, no async client and no `tool_runner`: an agent loop on
+  it is written by hand, as in cifras-verificables, and the tools were checked against Vertex AI only through that loop. The
+  prices are a table in the code, dated, and have to be updated by hand.
 
 The design is in [docs/design.md](docs/design.md) and the choices behind it in
 [docs/decisions.md](docs/decisions.md).

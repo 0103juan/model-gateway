@@ -352,3 +352,13 @@ def test_the_async_gateway_awaits_calls_and_runs_the_async_tool_runner():
 
     assert asyncio.run(run()).content[0].text == "It is 5."
     assert [call["model"] for call in gateway.calls] == ["claude-sonnet-5-5"] * 2 and gateway.calls[0]["fallback"]
+
+
+def test_threads_sharing_a_gateway_leave_one_whole_ledger_line_per_call(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    gateway = Gateway(fake_client(), ledger=tmp_path / "ledger.jsonl")
+    with ThreadPoolExecutor(16) as workers:
+        list(workers.map(lambda n: gateway.create(task="t", messages=[{"role": "user", "content": str(n)}]), range(400)))
+    lines = (tmp_path / "ledger.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 400 and all(json.loads(line)["key"] == "default" for line in lines)
+    assert gateway.spent == pytest.approx(sum(call["usd"] for call in gateway.calls))
